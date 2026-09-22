@@ -1,16 +1,18 @@
 # ============================================================
-# ARGUS — ПЕРЕВОДЧИК (EN → RU) v3 [PRODUCTION]
+# Personal Books - TRANSLATE (any -> RU) v4 [PRODUCTION]
 # ------------------------------------------------------------
-# v3: продакшн-версия.
-#   • Файловый кэш переводов (data/translation_cache.json)
-#   • Batch-перевод (до 32 фраз за раз — быстрее в 5-10 раз)
-#   • Ленивая загрузка модели (загружается только при первом вызове)
-#   • Потокобезопасность (threading.Lock)
-#   • Поддержка обоих входов: одиночная строка и список
-#   • Безопасные ошибки: при сбое возвращает оригинал
+# v4: мультиязычный перевод через NLLB-200.
+#     - 200+ языков -> русский напрямую
+#     - авто-детект исходного языка (langdetect)
+#     - файловый кэш
+#     - batch-перевод
+#     - ленивая загрузка модели
 # ------------------------------------------------------------
-# v2: torch.no_grad() для экономии памяти
-# v1: базовый перевод через Helsinki-NLP/opus-mt-en-ru
+# Требования:
+#   pip install transformers==4.41.2
+#               sentencepiece
+#               torch==2.2.0
+#               langdetect
 # ============================================================
 
 import os
@@ -26,16 +28,51 @@ DATA_DIR = REPO_ROOT / "data"
 CACHE_FILE = DATA_DIR / "translation_cache.json"
 
 # --- Настройки ---
-MODEL_NAME = "Helsinki-NLP/opus-mt-en-ru"
-MAX_CHARS = 500          # обрезка одного текста
-BATCH_SIZE = 16          # сколько текстов за раз прогонять через модель
-CACHE_MAX_SIZE = 5000    # максимум записей в кэше (FIFO-очистка)
+MODEL_NAME = "facebook/nllb-200-distilled-600M"
+TGT_LANG = "rus_Cyrl"
+MAX_CHARS = 500
+BATCH_SIZE = 8
+CACHE_MAX_SIZE = 5000
+
+# --- Коды NLLB для langdetect ---
+LANG_MAP = {
+    "en": "eng_Latn",
+    "es": "spa_Latn",
+    "de": "deu_Latn",
+    "fr": "fra_Latn",
+    "it": "ita_Latn",
+    "pt": "por_Latn",
+    "nl": "nld_Latn",
+    "pl": "pol_Latn",
+    "ru": "rus_Cyrl",
+    "uk": "ukr_Cyrl",
+    "zh-cn": "zho_Hans",
+    "zh-tw": "zho_Hant",
+    "ja": "jpn_Jpan",
+    "ko": "kor_Hang",
+    "ar": "arb_Arab",
+    "tr": "tur_Latn",
+    "vi": "vie_Latn",
+    "hi": "hin_Deva",
+    "cs": "ces_Latn",
+    "sv": "swe_Latn",
+    "da": "dan_Latn",
+    "fi": "fin_Latn",
+    "no": "nob_Latn",
+    "el": "ell_Grek",
+    "he": "heb_Hebr",
+    "hu": "hun_Latn",
+    "ro": "ron_Latn",
+    "bg": "bul_Cyrl",
+    "sr": "srp_Cyrl",
+    "hr": "hrv_Latn",
+}
 
 # --- Внутреннее состояние ---
 _model = None
 _tokenizer = None
 _lock = threading.Lock()
-_cache = None            # ленивая загрузка с диска
+_cache = None
 
 
 # ============================================================
@@ -62,22 +99,46 @@ def _save_cache():
     if _cache is None:
         return
     try:
-        # FIFO-очистка при переполнении
         if len(_cache) > CACHE_MAX_SIZE:
             keys = list(_cache.keys())
-            _cache_new = {k: _cache[k] for k in keys[-CACHE_MAX_SIZE:]}
+            new_cache = {k: _cache[k] for k in keys[-CACHE_MAX_SIZE:]}
             _cache.clear()
-            _cache.update(_cache_new)
+            _cache.update(new_cache)
 
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(_cache, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"⚠️ Не сохранил кэш переводов: {e}")
+        print("warn: cache save failed: " + str(e))
 
 
 def _cache_key(text: str) -> str:
     return hashlib.md5(text.encode("utf-8")).hexdigest()
+
+
+# ============================================================
+# LANG DETECT
+# ============================================================
+def detect_lang(text: str) -> str:
+    """Определяет язык текста. Возвращает код типа 'en', 'es'."""
+    try:
+        from langdetect import detect
+        code = detect(text[:500])
+        return code
+    except Exception:
+        return "en"
+
+
+def get_nllb_code(lang: str) -> str:
+    """Конвертирует код langdetect в код NLLB."""
+    lang = lang.lower()
+    if lang in LANG_MAP:
+        return LANG_MAP[lang]
+    # Fallback: пробуем по первым двум буквам
+    short = lang[:2]
+    if short in LANG_MAP:
+        return LANG_MAP[short]
+    return "eng_Latn"
 
 
 # ============================================================
@@ -88,31 +149,41 @@ def _load_model():
     with _lock:
         if _model is None:
             import torch
-            from transformers import MarianMTModel, MarianTokenizer
-            print(f"🌐 Загружаю модель перевода: {MODEL_NAME}")
-            _tokenizer = MarianTokenizer.from_pretrained(MODEL_NAME)
-            _model = MarianMTModel.from_pretrained(MODEL_NAME)
+            from transformers import (
+                AutoModelForSeq2SeqLM,
+                AutoTokenizer,
+            )
+            print("Loading NLLB-200: " + MODEL_NAME)
+            _tokenizer = AutoTokenizer.from_pretrained(
+                MODEL_NAME,
+                src_lang="eng_Latn",
+            )
+            _model = AutoModelForSeq2SeqLM.from_pretrained(
+                MODEL_NAME
+            )
             _model.eval()
-            print("✅ Модель перевода готова")
+            print("NLLB-200 ready")
     return _model, _tokenizer
 
 
 # ============================================================
 # ПУБЛИЧНЫЕ ФУНКЦИИ
 # ============================================================
-def is_english(text: str) -> bool:
-    """Эвристика: больше 60% букв — латиница."""
+def is_russian(text: str) -> bool:
     if not text:
         return False
-    letters = [c for c in text if c.isalpha()]
+    sample = text[:3000]
+    letters = [c for c in sample if c.isalpha()]
     if not letters:
         return False
-    latin = sum(1 for c in letters if c.isascii())
-    return (latin / len(letters)) > 0.6
+    cyr = 0
+    for c in letters:
+        if "\u0400" <= c <= "\u04ff":
+            cyr += 1
+    return (cyr / len(letters)) > 0.5
 
 
 def translate_to_ru(text: str) -> str:
-    """Переводит одну строку. При ошибке возвращает оригинал."""
     if not text or not text.strip():
         return text
 
@@ -121,15 +192,18 @@ def translate_to_ru(text: str) -> str:
     if key in cache:
         return cache[key]
 
-    # Не английский — не переводим
-    if not is_english(text):
+    if is_russian(text):
         cache[key] = text
         return text
+
+    src_lang = detect_lang(text)
+    nllb_src = get_nllb_code(src_lang)
 
     try:
         import torch
         model, tokenizer = _load_model()
 
+        tokenizer.src_lang = nllb_src
         truncated = text[:MAX_CHARS]
         tokens = tokenizer(
             [truncated],
@@ -140,26 +214,29 @@ def translate_to_ru(text: str) -> str:
         )
 
         with torch.no_grad():
-            translated = model.generate(**tokens)
+            translated = model.generate(
+                **tokens,
+                forced_bos_token_id=tokenizer.lang_code_to_id[
+                    TGT_LANG
+                ],
+                max_length=512,
+            )
 
-        result = tokenizer.decode(translated[0], skip_special_tokens=True).strip()
+        result = tokenizer.decode(
+            translated[0], skip_special_tokens=True
+        ).strip()
 
         if result:
             cache[key] = result
             return result
 
     except Exception as e:
-        print(f"⚠️ Ошибка перевода: {e}")
+        print("translate err: " + str(e))
 
     return text
 
 
 def translate_batch(texts: list) -> list:
-    """
-    Переводит список текстов за один прогон модели.
-    В 5-10 раз быстрее чем по одному.
-    Возвращает список переводов в том же порядке.
-    """
     if not texts:
         return []
 
@@ -167,8 +244,9 @@ def translate_batch(texts: list) -> list:
     results = [None] * len(texts)
     to_translate_idx = []
     to_translate_texts = []
+    to_translate_srcs = []
 
-    # 1. Сначала проверяем кэш и не-английские
+    # 1. Проверяем кэш и русский
     for i, text in enumerate(texts):
         if not text or not text.strip():
             results[i] = text
@@ -177,12 +255,13 @@ def translate_batch(texts: list) -> list:
         if key in cache:
             results[i] = cache[key]
             continue
-        if not is_english(text):
+        if is_russian(text):
             cache[key] = text
             results[i] = text
             continue
         to_translate_idx.append(i)
         to_translate_texts.append(text[:MAX_CHARS])
+        to_translate_srcs.append(detect_lang(text))
 
     if not to_translate_texts:
         return results
@@ -192,9 +271,49 @@ def translate_batch(texts: list) -> list:
         import torch
         model, tokenizer = _load_model()
 
-        # Прогоняем порциями по BATCH_SIZE
         for start in range(0, len(to_translate_texts), BATCH_SIZE):
             batch = to_translate_texts[start:start + BATCH_SIZE]
+            srcs = to_translate_srcs[start:start + BATCH_SIZE]
+
+            # NLLB требует один src_lang на батч
+            # Если языки разные — переводим по одному
+            unique_srcs = set(srcs)
+            if len(unique_srcs) > 1:
+                for j, text in enumerate(batch):
+                    idx = to_translate_idx[start + j]
+                    src = get_nllb_code(srcs[j])
+                    tokenizer.src_lang = src
+                    tokens = tokenizer(
+                        [text],
+                        return_tensors="pt",
+                        padding=True,
+                        truncation=True,
+                        max_length=512,
+                    )
+                    with torch.no_grad():
+                        translated = model.generate(
+                            **tokens,
+                            forced_bos_token_id=(
+                                tokenizer.lang_code_to_id[
+                                    TGT_LANG
+                                ]
+                            ),
+                            max_length=512,
+                        )
+                    result = tokenizer.decode(
+                        translated[0],
+                        skip_special_tokens=True,
+                    ).strip()
+                    if result:
+                        results[idx] = result
+                        cache[_cache_key(texts[idx])] = result
+                    else:
+                        results[idx] = texts[idx]
+                continue
+
+            # Один язык на весь батч
+            src = get_nllb_code(srcs[0])
+            tokenizer.src_lang = src
             tokens = tokenizer(
                 batch,
                 return_tensors="pt",
@@ -203,8 +322,16 @@ def translate_batch(texts: list) -> list:
                 max_length=512,
             )
             with torch.no_grad():
-                translated = model.generate(**tokens)
-            decoded = tokenizer.batch_decode(translated, skip_special_tokens=True)
+                translated = model.generate(
+                    **tokens,
+                    forced_bos_token_id=tokenizer.lang_code_to_id[
+                        TGT_LANG
+                    ],
+                    max_length=512,
+                )
+            decoded = tokenizer.batch_decode(
+                translated, skip_special_tokens=True
+            )
 
             for j, result in enumerate(decoded):
                 idx = to_translate_idx[start + j]
@@ -216,18 +343,17 @@ def translate_batch(texts: list) -> list:
                     results[idx] = texts[idx]
 
     except Exception as e:
-        print(f"⚠️ Batch-перевод упал: {e}")
-        # Fallback — то что не перевели, возвращаем как есть
+        print("batch translate err: " + str(e))
         for idx in to_translate_idx:
             if results[idx] is None:
                 results[idx] = texts[idx]
 
-    # Сохраняем кэш один раз в конце
     _save_cache()
-
-    return [r if r is not None else texts[i] for i, r in enumerate(results)]
+    return [
+        r if r is not None else texts[i]
+        for i, r in enumerate(results)
+    ]
 
 
 def save_cache():
-    """Публичный метод — сохранить кэш на диск (вызывать в конце работы)."""
     _save_cache()
