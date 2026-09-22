@@ -1,8 +1,9 @@
 # ============================================================
 # ARGUS - СКАЧИВАНИЕ ЛИЧНОЙ КНИГИ
 # ------------------------------------------------------------
-# Принимает URL и title через repository_dispatch.
-# Скачивает PDF → коммитит в personal_books/.
+# v1.1: fix имени скрипта (personal_downloader.py)
+# v1.0: принимает URL и title через repository_dispatch
+#       скачивает PDF -> коммитит в personal_books/
 # ============================================================
 
 name: Personal Download
@@ -44,11 +45,17 @@ jobs:
 
       - name: Run download
         env:
-          BOOK_URL: ${{ github.event.client_payload.url || github.event.inputs.url }}
-          BOOK_TITLE: ${{ github.event.client_payload.title || github.event.inputs.title }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python scripts/personal_download.py
+          BOOK_URL: >-
+            ${{ github.event.client_payload.url
+             || github.event.inputs.url }}
+          BOOK_TITLE: >-
+            ${{ github.event.client_payload.title
+             || github.event.inputs.title }}
+          TELEGRAM_BOT_TOKEN: >-
+            ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: >-
+            ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/personal_downloader.py
 
       - name: Commit PDF
         run: |
@@ -73,9 +80,14 @@ jobs:
       - name: Notify on failure
         if: failure()
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_BOT_TOKEN: >-
+            ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: >-
+            ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+          curl -s -X POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -H "Content-Type: application/json" \
-            -d "{\"chat_id\": \"${TELEGRAM_CHAT_ID}\", \"text\": \"Personal Download упал\", \"parse_mode\": \"HTML\"}" || true
+            -d "{\"chat_id\": \"${TELEGRAM_CHAT_ID}\", \
+                 \"text\": \"Personal Download упал\", \
+                 \"parse_mode\": \"HTML\"}" || true
