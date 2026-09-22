@@ -1,11 +1,8 @@
 # ============================================================
 # ARGUS - PERSONAL AUDIO (PDF -> TEXT -> RU -> MP3 -> TG)
 # ------------------------------------------------------------
+# v3: numpy<2 (совместимость с torch 2.2.0).
 # v2: мультиязычный перевод (NLLB-200).
-#     - принимает book через dispatch
-#     - ffmpeg для concat mp3
-#     - кэш _RU.txt коммитится обратно
-# v1: базовый PDF -> MP3
 # ============================================================
 
 name: Personal Audio
@@ -14,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       book:
-        description: 'Имя книги (без .pdf)'
+        description: 'Имя книги'
         required: true
       prefer:
         description: 'ru или en'
@@ -53,6 +50,7 @@ jobs:
       - name: Install Python deps
         run: |
           pip install --upgrade pip
+          pip install "numpy<2"
           pip install requests==2.32.3
           pip install gTTS
           pip install PyPDF2
@@ -92,7 +90,7 @@ jobs:
           git add personal_books/*_RU.txt || true
           git add data/translation_cache.json || true
           if git diff --staged --quiet; then
-            echo "No changes to commit"
+            echo "No changes"
             exit 0
           fi
           git commit -m "ARGUS: audio cache [skip ci]"
