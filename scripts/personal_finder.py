@@ -1,16 +1,14 @@
 # ============================================================
 # Personal Books - FINDER
 # ------------------------------------------------------------
-# v7: production-ready.
-#     - логи с timestamp
-#     - убраны упоминания других проектов
-#     - длинные таймауты, retry на ошибки
-#     - короткие строки (не рвутся при копипасте)
-#     - карточки по одной с кнопками
+# v8: NLLB-200 перевод (любой язык -> RU).
+#     - убран Helsinki, используется translate.py
+#     - batch-перевод титлов и summary
+# v7: production-ready, карточки по одной.
 # ------------------------------------------------------------
 # Требования:
-#   pip install requests transformers sentencepiece
-#            sacremoses torch
+#   pip install requests transformers
+#            sentencepiece torch langdetect
 # ============================================================
 
 import os
@@ -30,6 +28,18 @@ CANDIDATES_FILE = DATA_DIR / "personal_candidates.json"
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+# --- Перевод (NLLB) ---
+sys.path.insert(0, str(SCRIPT_DIR))
+TRANSLATE_AVAILABLE = False
+try:
+    from translate import translate_batch
+    from translate import translate_to_ru
+    from translate import is_russian
+    from translate import save_cache
+    TRANSLATE_AVAILABLE = True
+except ImportError as e:
+    print("WARN: translate.py missing: " + str(e))
+
 # --- Telegram ---
 BOT_TOKEN = (
     os.getenv("TELEGRAM_BOT_TOKEN")
@@ -46,13 +56,6 @@ PAGE_SIZE = 5
 MAX_CARDS = 30
 TIMEOUT = 30
 
-# --- Модели перевода ---
-TRANSLATE_AVAILABLE = False
-_model_en_ru = None
-_model_ru_en = None
-_tok_en_ru = None
-_tok_ru_en = None
-
 
 # ============================================================
 # LOG
@@ -63,87 +66,22 @@ def log(msg):
 
 
 # ============================================================
-# TRANSLATE
+# TRANSLATE WRAPPERS
 # ============================================================
-def _load_models():
-    global TRANSLATE_AVAILABLE
-    global _model_en_ru, _model_ru_en
-    global _tok_en_ru, _tok_ru_en
-    try:
-        from transformers import (
-            MarianMTModel, MarianTokenizer,
-        )
-        log("loading translation models...")
-        name1 = "Helsinki-NLP/opus-mt-ru-en"
-        _tok_ru_en = MarianTokenizer.from_pretrained(name1)
-        _model_ru_en = MarianMTModel.from_pretrained(name1)
-        name2 = "Helsinki-NLP/opus-mt-en-ru"
-        _tok_en_ru = MarianTokenizer.from_pretrained(name2)
-        _model_en_ru = MarianMTModel.from_pretrained(name2)
-        TRANSLATE_AVAILABLE = True
-        log("translation ready")
-    except Exception as e:
-        log("translator off: " + str(e))
-
-
-def translate_to_en(text):
-    if not TRANSLATE_AVAILABLE or not text:
-        return text
-    try:
-        batch = _tok_ru_en(
-            [text], return_tensors="pt",
-            padding=True, truncation=True,
-            max_length=128,
-        )
-        out = _model_ru_en.generate(**batch)
-        return _tok_ru_en.decode(
-            out[0], skip_special_tokens=True,
-        )
-    except Exception:
-        return text
-
-
-def translate_to_ru(text):
-    if not TRANSLATE_AVAILABLE or not text:
-        return text
-    try:
-        batch = _tok_en_ru(
-            [text], return_tensors="pt",
-            padding=True, truncation=True,
-            max_length=512,
-        )
-        out = _model_en_ru.generate(**batch)
-        return _tok_en_ru.decode(
-            out[0], skip_special_tokens=True,
-        )
-    except Exception:
-        return text
-
-
-def is_cyrillic(text):
-    for c in text:
-        low = c.lower()
-        if 'а' <= low <= 'я':
-            return True
-        if low == 'ё':
-            return True
-    return False
-
-
 def ensure_russian(text):
+    """Перевод на русский через NLLB."""
     if not text:
         return text
-    if is_cyrillic(text):
+    if not TRANSLATE_AVAILABLE:
+        return text
+    if is_russian(text):
         return text
     return translate_to_ru(text) or text
 
 
 def ensure_english(text):
-    if not text:
-        return text
-    if not is_cyrillic(text):
-        return text
-    return translate_to_en(text) or text
+    """Обратный перевод не делаем — NLLB сам."""
+    return text
 
 
 # ============================================================
@@ -430,6 +368,40 @@ def format_card(i, item, total):
 
 
 # ============================================================
+# TRANSLATE ITEMS
+# ============================================================
+def translate_items(items):
+    """Batch-перевод всех titлов и summary на русский."""
+    if not TRANSLATE_AVAILABLE:
+        log("translate.py missing, skip")
+        return
+
+    titles = []
+    summaries = []
+    for it in items:
+        titles.append(it.get("title", ""))
+        summaries.append(it.get("summary", "")[:400])
+
+    log("translating " + str(len(items)) + " titles...")
+    tr_titles = translate_batch(titles)
+
+    log("translating " + str(len(items)) + " summaries...")
+    tr_summaries = translate_batch(summaries)
+
+    for i, it in enumerate(items):
+        orig = it.get("title", "")
+        new_t = tr_titles[i]
+        if new_t and new_t != orig:
+            it["title"] = new_t
+            it["title_original"] = orig
+        new_s = tr_summaries[i]
+        if new_s:
+            it["summary"] = new_s
+
+    save_cache()
+
+
+# ============================================================
 # MAIN
 # ============================================================
 def main():
@@ -439,11 +411,6 @@ def main():
 
     topic = " ".join(sys.argv[1:]).strip()
     log("search: " + topic)
-
-    _load_models()
-
-    topic_en = ensure_english(topic)
-    log("EN topic: " + topic_en)
     log("=" * 50)
 
     all_items = []
@@ -454,7 +421,7 @@ def main():
     ]
     for name, fn in sources:
         log(name + "...")
-        res = fn(topic_en, limit=10)
+        res = fn(topic, limit=10)
         log("  found: " + str(len(res)))
         all_items.extend(res)
 
@@ -466,7 +433,7 @@ def main():
 
     # Filter
     for it in all_items:
-        it["score"] = relevance_score(it, topic_en)
+        it["score"] = relevance_score(it, topic)
     scored = [x for x in all_items if x["score"] > 0]
     scored.sort(key=lambda x: x["score"], reverse=True)
 
@@ -482,20 +449,11 @@ def main():
 
     # Translate
     to_show = scored[:MAX_CARDS]
-    log("translating " + str(len(to_show)) + " items")
-    for it in to_show:
-        orig = it["title"]
-        it["title"] = ensure_russian(orig)
-        if it["title"] != orig:
-            it["title_original"] = orig
-        s = it.get("summary", "")
-        if s:
-            it["summary"] = ensure_russian(s[:400])
+    translate_items(to_show)
 
     # Save
     candidates = {
         "topic": topic,
-        "topic_en": topic_en,
         "generated_at": datetime.now(
             timezone.utc,
         ).isoformat(),
@@ -517,7 +475,7 @@ def main():
     header += "Showing first " + str(PAGE_SIZE) + ":"
     send_message(header)
 
-    # Cards one by one
+    # Cards
     for i in range(PAGE_SIZE):
         if i >= len(to_show):
             break
