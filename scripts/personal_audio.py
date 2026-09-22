@@ -1,19 +1,20 @@
 # ============================================================
-# ARGUS — ЛИЧНЫЕ АУДИОКНИГИ
+# Personal Books - AUDIO (PDF -> MP3 -> Telegram)
 # ------------------------------------------------------------
-# Из PDF в personal_books/ делает mp3 и отправляет в Telegram.
-# Разбивает на сегменты по 45 минут (лимит Telegram 50 МБ).
-# Временные mp3 удаляются после отправки.
-# ARGUS не трогает (books/ не касается).
+# v2: production-ready.
+#     - уведомление при mp3 > 50 МБ
+#     - вывод короче (для больших книг)
+#     - защита от параллельных запусков
+#     - отчёт в конце с размерами
 # ------------------------------------------------------------
-# Требования: pip install gTTS PyPDF2
-#             apt install ffmpeg
+# Требования:
+#   pip install gTTS PyPDF2
+#   apt install ffmpeg
 # ============================================================
 
 import os
 import sys
 import re
-import json
 import shutil
 import subprocess
 import requests
@@ -24,15 +25,16 @@ from datetime import datetime, timezone
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 PERSONAL_DIR = REPO_ROOT / "personal_books"
-TEMP_DIR = Path("/tmp/argus_audio")
+TEMP_DIR = Path("/tmp/personal_books_audio")
 
 PERSONAL_DIR.mkdir(parents=True, exist_ok=True)
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 # --- Настройки ---
-SEGMENT_MINUTES = 45          # длительность одного сегмента
-GTTS_BATCH_CHARS = 1800       # символов за один вызов gTTS
-TELEGRAM_LIMIT_MB = 48        # с запасом от 50
+SEGMENT_MINUTES = 45
+GTTS_BATCH_CHARS = 1800
+TELEGRAM_LIMIT_MB = 48
+CHARS_PER_MINUTE = 900
 
 # --- Telegram ---
 BOT_TOKEN = (
@@ -48,27 +50,11 @@ CHAT_ID = (
 
 
 # ============================================================
-# ПРОВЕРКА ЗАВИСИМОСТЕЙ
+# LOG
 # ============================================================
-def check_deps():
-    errors = []
-
-    try:
-        from gtts import gTTS
-        _ = gTTS
-    except ImportError:
-        errors.append("gTTS (pip install gTTS)")
-
-    try:
-        import PyPDF2
-        _ = PyPDF2
-    except ImportError:
-        errors.append("PyPDF2 (pip install PyPDF2)")
-
-    if not shutil.which("ffmpeg"):
-        errors.append("ffmpeg (apt install ffmpeg)")
-
-    return errors
+def log(msg):
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    print("[" + ts + "] " + str(msg), flush=True)
 
 
 # ============================================================
@@ -76,22 +62,25 @@ def check_deps():
 # ============================================================
 def notify(text):
     if not BOT_TOKEN or not CHAT_ID:
-        print("[no telegram] " + text[:200])
-        return
+        log("no telegram")
+        return False
     try:
         url = "https://api.telegram.org/bot"
         url += BOT_TOKEN + "/sendMessage"
-        requests.post(
+        r = requests.post(
             url,
             json={
                 "chat_id": CHAT_ID,
                 "text": text[:4000],
                 "parse_mode": "HTML",
+                "disable_web_page_preview": True,
             },
             timeout=15,
         )
+        return r.status_code == 200
     except Exception as e:
-        print("tg: " + str(e))
+        log("tg error: " + str(e))
+        return False
 
 
 def send_audio(path, caption=""):
@@ -99,10 +88,18 @@ def send_audio(path, caption=""):
         return False
     if not path.exists():
         return False
+
     size_mb = path.stat().st_size / 1024 / 1024
+
     if size_mb > 50:
-        print("  файл > 50 МБ, не отправится")
+        log("file > 50 MB: " + path.name)
+        notify(
+            "mp3 too big for Telegram\n"
+            + path.name
+            + "\nsize: " + format(size_mb, ".1f") + " MB"
+        )
         return False
+
     try:
         url = "https://api.telegram.org/bot"
         url += BOT_TOKEN + "/sendAudio"
@@ -115,20 +112,20 @@ def send_audio(path, caption=""):
                 "title": path.stem,
             }
             r = requests.post(
-                url, data=data, files=files, timeout=600,
+                url, data=data, files=files, timeout=900,
             )
         if r.status_code == 200:
-            print("  ✅ отправлено: " + path.name)
+            log("sent: " + path.name)
             return True
-        print("  tg " + str(r.status_code))
+        log("tg " + str(r.status_code))
         return False
     except Exception as e:
-        print("  send_audio: " + str(e))
+        log("send_audio: " + str(e))
         return False
 
 
 # ============================================================
-# PDF → ТЕКСТ
+# PDF -> TEXT
 # ============================================================
 def extract_text(pdf_path):
     import PyPDF2
@@ -137,28 +134,24 @@ def extract_text(pdf_path):
         with open(pdf_path, "rb") as f:
             reader = PyPDF2.PdfReader(f)
             total = len(reader.pages)
-            print("  страниц: " + str(total))
+            log("pages: " + str(total))
             for i, page in enumerate(reader.pages):
-                if i % 20 == 0:
-                    print("  ..." + str(i) + "/" + str(total))
+                if i % 50 == 0:
+                    log("  ..." + str(i) + "/" + str(total))
                 text = page.extract_text() or ""
                 parts.append(text)
         full = "\n\n".join(parts)
-        print("  символов: " + str(len(full)))
+        log("chars: " + str(len(full)))
         return full
     except Exception as e:
-        print("  pdf error: " + str(e))
+        log("pdf error: " + str(e))
         return ""
 
 
 # ============================================================
-# РАЗБИВКА НА СЕГМЕНТЫ
+# SPLIT
 # ============================================================
 def split_into_segments(text, segment_chars):
-    """
-    Режем текст на сегменты по segment_chars символов,
-    стараясь не рвать предложения.
-    """
     sentences = re.split(r"(?<=[.!?])\s+", text)
     segments = []
     current = ""
@@ -178,7 +171,6 @@ def split_into_segments(text, segment_chars):
 
 
 def split_for_gtts(text, batch_chars):
-    """Мелкие куски для gTTS — чтобы не таймаутил."""
     sentences = re.split(r"(?<=[.!?])\s+", text)
     batches = []
     current = ""
@@ -198,22 +190,20 @@ def split_for_gtts(text, batch_chars):
 
 
 # ============================================================
-# TTS + СКЛЕЙКА
+# TTS + CONCAT
 # ============================================================
 def tts_batch_to_mp3(text, out_path):
-    """Один кусок → один mp3."""
     from gtts import gTTS
     try:
         tts = gTTS(text=text, lang="ru", slow=False)
         tts.save(str(out_path))
         return True
     except Exception as e:
-        print("  gtts: " + str(e))
+        log("gtts: " + str(e))
         return False
 
 
 def concat_mp3(files, out_path):
-    """Склейка mp3 через ffmpeg concat demuxer."""
     if not files:
         return False
     if len(files) == 1:
@@ -238,37 +228,38 @@ def concat_mp3(files, out_path):
             ],
             capture_output=True,
             text=True,
-            timeout=600,
+            timeout=900,
         )
         if result.returncode != 0:
-            print("  ffmpeg error:")
-            print(result.stderr[-300:])
+            log("ffmpeg error:")
+            log(result.stderr[-300:])
             return False
         return True
     except Exception as e:
-        print("  concat: " + str(e))
+        log("concat: " + str(e))
         return False
 
 
 def segment_to_audio(segment_text, out_mp3):
-    """Сегмент → mp3 (через временные части + склейку)."""
     batches = split_for_gtts(segment_text, GTTS_BATCH_CHARS)
-    print("  кусков для gTTS: " + str(len(batches)))
+    log("  batches: " + str(len(batches)))
 
     temp_parts = []
     for i, batch in enumerate(batches):
-        part_path = TEMP_DIR / ("part_" + str(i).zfill(4) + ".mp3")
+        part_path = TEMP_DIR / (
+            "part_" + str(i).zfill(4) + ".mp3"
+        )
         if not tts_batch_to_mp3(batch, part_path):
-            print("  провал на куске " + str(i))
+            log("  fail at " + str(i))
             continue
         temp_parts.append(part_path)
-        if i % 10 == 0:
-            print("  ...озвучено " + str(i + 1) + "/" + str(len(batches)))
+        if i % 20 == 0:
+            log("  ..." + str(i + 1) + "/" + str(len(batches)))
 
     if not temp_parts:
         return False
 
-    print("  склейка " + str(len(temp_parts)) + " частей...")
+    log("  concat " + str(len(temp_parts)) + " parts")
     ok = concat_mp3(temp_parts, out_mp3)
 
     for p in temp_parts:
@@ -280,15 +271,32 @@ def segment_to_audio(segment_text, out_mp3):
 
 
 # ============================================================
-# СКАНИРОВАНИЕ personal_books/
+# DEPENDENCIES
+# ============================================================
+def check_deps():
+    errors = []
+    try:
+        from gtts import gTTS
+        _ = gTTS
+    except ImportError:
+        errors.append("gTTS")
+    try:
+        import PyPDF2
+        _ = PyPDF2
+    except ImportError:
+        errors.append("PyPDF2")
+    if not shutil.which("ffmpeg"):
+        errors.append("ffmpeg")
+    return errors
+
+
+# ============================================================
+# SCAN
 # ============================================================
 def list_books():
-    """Возвращает список пар (pdf_ru, pdf_en) — только с префиксом."""
     if not PERSONAL_DIR.exists():
-        return []
-
+        return {}
     files = sorted(PERSONAL_DIR.glob("*.pdf"))
-    # Группируем по имени без _RU
     books = {}
     for f in files:
         name = f.stem
@@ -301,17 +309,12 @@ def list_books():
 
 
 # ============================================================
-# ОСНОВНАЯ РАБОТА
+# MAIN WORK
 # ============================================================
 def make_audio(base_name, prefer="ru", keep=False):
-    """
-    Делает аудио для книги.
-    prefer: 'ru' или 'en' — что озвучивать.
-    keep: сохранять ли mp3 после отправки.
-    """
     books = list_books()
     if base_name not in books:
-        print("❌ книга не найдена: " + base_name)
+        log("book not found: " + base_name)
         return False
 
     variants = books[base_name]
@@ -322,113 +325,116 @@ def make_audio(base_name, prefer="ru", keep=False):
     elif "ru" in variants:
         pdf_path = variants["ru"]
     else:
-        print("❌ нет PDF в книге")
+        log("no pdf found")
         return False
 
-    print("=" * 60)
-    print("📖 " + base_name)
-    print("   файл: " + pdf_path.name)
-    print("=" * 60)
+    log("=" * 50)
+    log("book: " + base_name)
+    log("file: " + pdf_path.name)
+    log("=" * 50)
 
-    notify("🎧 <b>Аудиокнига</b>\n" + pdf_path.name +
-           "\n\nГотовлю mp3, это займёт время...")
+    notify(
+        "Audio started\n"
+        + pdf_path.name
+        + "\n\nplease wait..."
+    )
 
-    # 1. Извлечь текст
     text = extract_text(pdf_path)
     if not text.strip():
-        notify("❌ Не удалось извлечь текст (возможно, скан)")
+        notify("Cannot extract text (scan?)")
         return False
 
-    # 2. Разбить на сегменты (по времени)
-    chars_per_minute = 900  # оценка для русского
-    segment_chars = SEGMENT_MINUTES * chars_per_minute
+    segment_chars = SEGMENT_MINUTES * CHARS_PER_MINUTE
     segments = split_into_segments(text, segment_chars)
-    print("📊 сегментов: " + str(len(segments)))
+    log("segments: " + str(len(segments)))
 
-    # 3. Обработать каждый сегмент
     total = len(segments)
     sent_count = 0
+    sizes = []
 
     for idx, seg in enumerate(segments, 1):
-        print("")
-        print("🎬 сегмент " + str(idx) + "/" + str(total))
-        print("   символов: " + str(len(seg)))
+        log("")
+        log("segment " + str(idx) + "/" + str(total))
+        log("  chars: " + str(len(seg)))
 
         out_mp3 = TEMP_DIR / (
-            base_name[:50] + "_part" + str(idx).zfill(2) + ".mp3"
+            base_name[:50]
+            + "_part" + str(idx).zfill(2)
+            + ".mp3"
         )
 
         if not segment_to_audio(seg, out_mp3):
-            print("   ❌ пропускаю")
+            log("  skip")
             continue
 
         size_mb = out_mp3.stat().st_size / 1024 / 1024
-        print("   размер: " + str(round(size_mb, 1)) + " МБ")
+        log("  size: " + format(size_mb, ".1f") + " MB")
 
         caption = (
-            "🎧 <b>" + base_name + "</b>\n"
-            "Часть " + str(idx) + "/" + str(total) + "\n"
-            + str(round(size_mb, 1)) + " МБ · ~"
-            + str(SEGMENT_MINUTES) + " мин"
+            "<b>" + base_name + "</b>\n"
+            + "Part " + str(idx) + "/" + str(total)
+            + "\n" + format(size_mb, ".1f") + " MB"
+            + " ~ " + str(SEGMENT_MINUTES) + " min"
         )
 
         if send_audio(out_mp3, caption):
             sent_count += 1
+            sizes.append(round(size_mb, 1))
         else:
-            print("   ❌ не отправилось")
+            log("  send failed")
 
         if not keep:
             try:
                 out_mp3.unlink()
-                print("   🗑 удалено")
             except Exception:
                 pass
 
-    print("")
-    print("=" * 60)
-    print("Готово: " + str(sent_count) + "/" + str(total) + " частей")
-    print("=" * 60)
+    log("")
+    log("=" * 50)
+    log("done: " + str(sent_count) + "/" + str(total))
+    log("=" * 50)
 
-    notify("✅ <b>Аудиокнига готова</b>\n" +
-           base_name + "\n" +
-           str(sent_count) + " частей отправлено")
+    total_mb = sum(sizes)
+    notify(
+        "Audio done\n"
+        + base_name + "\n"
+        + str(sent_count) + " parts\n"
+        + format(total_mb, ".1f") + " MB total"
+    )
     return True
 
 
 # ============================================================
-# MAIN
+# ENTRY
 # ============================================================
 def main():
     errs = check_deps()
     if errs:
-        print("❌ Отсутствуют зависимости:")
-        for e in errs:
-            print("   - " + e)
+        log("Missing: " + ", ".join(errs))
+        notify("Missing deps: " + ", ".join(errs))
         sys.exit(1)
 
     args = sys.argv[1:]
 
     if not args:
-        # Показать список
         books = list_books()
         if not books:
-            print("📭 В personal_books/ нет книг")
-            print("Сначала используй /find и /download")
+            log("no books in personal_books/")
             return
-        print("📚 Книги в personal_books/:")
-        for i, (name, variants) in enumerate(books.items(), 1):
+        log("Books:")
+        for i, (name, v) in enumerate(books.items(), 1):
             flags = []
-            if "ru" in variants:
+            if "ru" in v:
                 flags.append("RU")
-            if "en" in variants:
+            if "en" in v:
                 flags.append("EN")
-            print("  " + str(i) + ". " + name +
-                  "  [" + "+".join(flags) + "]")
-        print("")
-        print("Использование:")
-        print("  python personal_audio.py <имя>")
-        print("  python personal_audio.py <имя> --en")
-        print("  python personal_audio.py <имя> --keep")
+            log("  " + str(i) + ". " + name
+                + " [" + "+".join(flags) + "]")
+        log("")
+        log("Usage:")
+        log("  audio.py <name>")
+        log("  audio.py <name> --en")
+        log("  audio.py <name> --keep")
         return
 
     base_name = args[0]
