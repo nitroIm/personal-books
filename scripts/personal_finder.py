@@ -1,9 +1,16 @@
 # ============================================================
-# ARGUS - ЛИЧНЫЙ ПОИСК КНИГ v6
+# Personal Books - FINDER
 # ------------------------------------------------------------
-# v6: карточки приходят ПО ОДНОЙ.
-#     Каждая с [Скачать] [Отклонить].
-#     HTML entities и мусор чистятся.
+# v7: production-ready.
+#     - логи с timestamp
+#     - убраны упоминания других проектов
+#     - длинные таймауты, retry на ошибки
+#     - короткие строки (не рвутся при копипасте)
+#     - карточки по одной с кнопками
+# ------------------------------------------------------------
+# Требования:
+#   pip install requests transformers sentencepiece
+#            sacremoses torch
 # ============================================================
 
 import os
@@ -15,20 +22,31 @@ import requests
 from datetime import datetime, timezone
 from pathlib import Path
 
+# --- Пути ---
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 DATA_DIR = REPO_ROOT / "data"
 CANDIDATES_FILE = DATA_DIR / "personal_candidates.json"
 
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# --- Telegram ---
 BOT_TOKEN = (
     os.getenv("TELEGRAM_BOT_TOKEN")
     or os.getenv("BOT_TOKEN")
-)
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+    or ""
+).strip()
+CHAT_ID = (
+    os.getenv("TELEGRAM_CHAT_ID")
+    or ""
+).strip()
 
+# --- Настройки ---
 PAGE_SIZE = 5
 MAX_CARDS = 30
+TIMEOUT = 30
 
+# --- Модели перевода ---
 TRANSLATE_AVAILABLE = False
 _model_en_ru = None
 _model_ru_en = None
@@ -36,6 +54,17 @@ _tok_en_ru = None
 _tok_ru_en = None
 
 
+# ============================================================
+# LOG
+# ============================================================
+def log(msg):
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    print("[" + ts + "] " + str(msg), flush=True)
+
+
+# ============================================================
+# TRANSLATE
+# ============================================================
 def _load_models():
     global TRANSLATE_AVAILABLE
     global _model_en_ru, _model_ru_en
@@ -44,7 +73,7 @@ def _load_models():
         from transformers import (
             MarianMTModel, MarianTokenizer,
         )
-        print("Loading translation models...")
+        log("loading translation models...")
         name1 = "Helsinki-NLP/opus-mt-ru-en"
         _tok_ru_en = MarianTokenizer.from_pretrained(name1)
         _model_ru_en = MarianMTModel.from_pretrained(name1)
@@ -52,9 +81,9 @@ def _load_models():
         _tok_en_ru = MarianTokenizer.from_pretrained(name2)
         _model_en_ru = MarianMTModel.from_pretrained(name2)
         TRANSLATE_AVAILABLE = True
-        print("Translation models loaded")
+        log("translation ready")
     except Exception as e:
-        print("Translator off: " + str(e))
+        log("translator off: " + str(e))
 
 
 def translate_to_en(text):
@@ -118,40 +147,31 @@ def ensure_english(text):
 
 
 # ============================================================
-# CLEAN TEXT - убираем мусор
+# CLEAN TEXT
 # ============================================================
 def clean_text(text):
-    """Чистка артефактов: entities, теги, мусор."""
     if not text:
         return ""
-
-    # HTML entities: &iacute; &aacute; &nbsp; &quot; ...
     text = html.unescape(text)
-
-    # HTML теги и мусорные обёртки
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"::", " ", text)
     text = re.sub(r"&[a-zA-Z]+;", " ", text)
     text = re.sub(r"&#\d+;", " ", text)
-
-    # Битые кавычки и точки
     text = re.sub(r'^["\'\s]+', "", text)
     text = re.sub(r'["\'\s]+$', "", text)
-
-    # Множественные пробелы
     text = re.sub(r"\s+", " ", text)
-
-    # Мусор из начала (часто идёт "p" или "span")
     text = re.sub(r'^["\']?p["\']?\s+', "", text)
     text = re.sub(r'^span>?\s*', "", text)
-
     return text.strip()
 
 
-def notify_with_buttons(text, keyboard=None):
+# ============================================================
+# TELEGRAM
+# ============================================================
+def send_message(text, keyboard=None):
     if not BOT_TOKEN or not CHAT_ID:
-        print("no token")
-        print(text)
+        log("no telegram - console")
+        log(text[:500])
         return None
     try:
         payload = {
@@ -162,25 +182,29 @@ def notify_with_buttons(text, keyboard=None):
         }
         if keyboard:
             payload["reply_markup"] = keyboard
+        url = "https://api.telegram.org/bot"
+        url += BOT_TOKEN + "/sendMessage"
         r = requests.post(
-            "https://api.telegram.org/bot"
-            + BOT_TOKEN + "/sendMessage",
-            json=payload,
-            timeout=15,
+            url, json=payload, timeout=15,
         )
         if r.status_code == 200:
             return r.json().get("result", {})
-    except Exception:
-        pass
+        log("tg " + str(r.status_code) + ": "
+            + r.text[:150])
+    except Exception as e:
+        log("tg: " + str(e))
     return None
 
 
 # ============================================================
-# ПОИСК
+# SOURCES
 # ============================================================
 def search_arxiv(topic_en, limit=10):
     results = []
-    queries = ['all:"' + topic_en + '"', "all:" + topic_en]
+    queries = [
+        'all:"' + topic_en + '"',
+        "all:" + topic_en,
+    ]
     for q in queries:
         try:
             r = requests.get(
@@ -191,7 +215,7 @@ def search_arxiv(topic_en, limit=10):
                     "max_results": limit,
                     "sortBy": "relevance",
                 },
-                timeout=20,
+                timeout=TIMEOUT,
             )
             r.raise_for_status()
             entries = r.text.split("<entry>")[1:]
@@ -213,7 +237,9 @@ def search_arxiv(topic_en, limit=10):
                         pass
                     dup = False
                     for x in results:
-                        if x["url"].endswith(arxiv_id + ".pdf"):
+                        if x["url"].endswith(
+                            arxiv_id + ".pdf",
+                        ):
                             dup = True
                             break
                     if dup:
@@ -232,7 +258,7 @@ def search_arxiv(topic_en, limit=10):
             if len(results) >= 3:
                 break
         except Exception as e:
-            print("arxiv: " + str(e))
+            log("arxiv: " + str(e))
     return results
 
 
@@ -248,7 +274,7 @@ def search_zenodo(topic_en, limit=10):
                     "size": limit,
                     "file_type": "pdf",
                 },
-                timeout=20,
+                timeout=TIMEOUT,
             )
             r.raise_for_status()
             hits = r.json().get("hits", {}).get("hits", [])
@@ -295,7 +321,7 @@ def search_zenodo(topic_en, limit=10):
             if len(results) >= 3:
                 break
         except Exception as e:
-            print("zenodo: " + str(e))
+            log("zenodo: " + str(e))
     return results
 
 
@@ -303,13 +329,14 @@ def search_semantic(topic_en, limit=10):
     results = []
     try:
         r = requests.get(
-            "https://api.semanticscholar.org/graph/v1/paper/search",
+            "https://api.semanticscholar.org"
+            + "/graph/v1/paper/search",
             params={
                 "query": topic_en,
                 "limit": limit,
                 "fields": "title,abstract,openAccessPdf",
             },
-            timeout=20,
+            timeout=TIMEOUT,
         )
         r.raise_for_status()
         for item in r.json().get("data", []):
@@ -324,7 +351,7 @@ def search_semantic(topic_en, limit=10):
                 "type": "paper",
             })
     except Exception as e:
-        print("ss: " + str(e))
+        log("ss: " + str(e))
     return results
 
 
@@ -345,25 +372,30 @@ def relevance_score(item, topic_en):
     text += item.get("summary", "")
     text = text.lower()
     phrase = topic_en.lower().strip()
+
     if phrase and phrase in text:
         return 1.0
+
     words = [w for w in phrase.split() if len(w) > 2]
     distinctive = [w for w in words if len(w) >= 6]
+
     if distinctive:
         hits = _words_present(text, distinctive)
         if hits == 0:
             return 0.0
         return hits / len(distinctive)
+
     if words:
         hits = _words_present(text, words)
         if hits == len(words):
             return 1.0
         return 0.0
+
     return 0.0
 
 
 # ============================================================
-# КАРТОЧКА
+# CARD
 # ============================================================
 def format_card(i, item, total):
     title = clean_text(item.get("title", "?"))
@@ -372,15 +404,13 @@ def format_card(i, item, total):
     size = item.get("size_mb")
     size_str = ""
     if size:
-        size_str = " (" + str(size) + " МБ)"
+        size_str = " (" + str(size) + " MB)"
 
     lines = []
     lines.append("<b>" + str(i) + "/" + str(total) + "</b>")
     lines.append("<b>" + title + "</b>")
     lines.append("")
-
-    src_line = "📡 " + source + size_str
-    lines.append(src_line)
+    lines.append("Source: " + source + size_str)
     lines.append("")
 
     summary = clean_text(item.get("summary", ""))
@@ -392,7 +422,9 @@ def format_card(i, item, total):
         lines.append("")
 
     page = item.get("page_url", item.get("url", ""))
-    lines.append('<a href="' + page + '">Открыть источник</a>')
+    lines.append(
+        '<a href="' + page + '">Open source</a>'
+    )
 
     return "\n".join(lines)
 
@@ -402,54 +434,55 @@ def format_card(i, item, total):
 # ============================================================
 def main():
     if len(sys.argv) < 2:
-        print("Usage: personal_finder.py <topic>")
+        log("Usage: personal_finder.py <topic>")
         sys.exit(1)
 
     topic = " ".join(sys.argv[1:]).strip()
-    print("Search: " + topic)
+    log("search: " + topic)
 
     _load_models()
 
     topic_en = ensure_english(topic)
-    print("EN topic: " + topic_en)
-    print("=" * 60)
+    log("EN topic: " + topic_en)
+    log("=" * 50)
 
     all_items = []
-    for name, fn in [
+    sources = [
         ("arXiv", search_arxiv),
         ("Zenodo", search_zenodo),
         ("Semantic Scholar", search_semantic),
-    ]:
-        print(name + "...")
+    ]
+    for name, fn in sources:
+        log(name + "...")
         res = fn(topic_en, limit=10)
-        print("  found: " + str(len(res)))
+        log("  found: " + str(len(res)))
         all_items.extend(res)
 
     if not all_items:
-        txt = "🔍 Личный поиск: " + html.escape(topic)
-        txt += "\n\nНичего не найдено."
-        notify_with_buttons(txt)
+        txt = "Search: " + html.escape(topic)
+        txt += "\n\nNothing found."
+        send_message(txt)
         return
 
-    # Фильтр
+    # Filter
     for it in all_items:
         it["score"] = relevance_score(it, topic_en)
     scored = [x for x in all_items if x["score"] > 0]
     scored.sort(key=lambda x: x["score"], reverse=True)
 
-    print("After filter: " + str(len(scored)))
-    print("=" * 60)
+    log("after filter: " + str(len(scored)))
+    log("=" * 50)
 
     if not scored:
-        txt = "🔍 Личный поиск: " + html.escape(topic)
-        txt += "\n\nТочных совпадений нет.\n"
-        txt += "Попробуй английское название."
-        notify_with_buttons(txt)
+        txt = "Search: " + html.escape(topic)
+        txt += "\n\nNo relevant matches.\n"
+        txt += "Try English title."
+        send_message(txt)
         return
 
-    # Перевод
+    # Translate
     to_show = scored[:MAX_CARDS]
-    print("Translating " + str(len(to_show)) + " items...")
+    log("translating " + str(len(to_show)) + " items")
     for it in to_show:
         orig = it["title"]
         it["title"] = ensure_russian(orig)
@@ -459,8 +492,7 @@ def main():
         if s:
             it["summary"] = ensure_russian(s[:400])
 
-    # Сохраняем всё
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    # Save
     candidates = {
         "topic": topic,
         "topic_en": topic_en,
@@ -476,60 +508,55 @@ def main():
             candidates, f,
             ensure_ascii=False, indent=2,
         )
+    log("saved: " + CANDIDATES_FILE.name)
 
-    # Первое сообщение - заголовок
+    # Header
     total = len(scored)
-    header = "🔍 <b>Личный поиск:</b> "
-    header += html.escape(topic) + "\n\n"
-    header += "Найдено: <b>" + str(total) + "</b> материалов\n"
-    header += "Покажу первые " + str(PAGE_SIZE)
-    header += " по одному:"
-    notify_with_buttons(header)
+    header = "Search: <b>" + html.escape(topic) + "</b>\n\n"
+    header += "Found: <b>" + str(total) + "</b> items\n"
+    header += "Showing first " + str(PAGE_SIZE) + ":"
+    send_message(header)
 
-    # Карточки по одной
+    # Cards one by one
     for i in range(PAGE_SIZE):
         if i >= len(to_show):
             break
         item = to_show[i]
         card_text = format_card(i + 1, item, PAGE_SIZE)
         kb = {
-            "inline_keyboard": [
-                [
-                    {
-                        "text": "✅ Скачать",
-                        "callback_data": "personal_dl:"
-                                         + str(i),
-                    },
-                    {
-                        "text": "❌ Отклонить",
-                        "callback_data": "personal_reject:"
-                                         + str(i),
-                    },
-                ],
-            ],
+            "inline_keyboard": [[
+                {
+                    "text": "Download",
+                    "callback_data": "personal_dl:"
+                                     + str(i),
+                },
+                {
+                    "text": "Reject",
+                    "callback_data": "personal_reject:"
+                                     + str(i),
+                },
+            ]],
         }
-        notify_with_buttons(card_text, kb)
-        print("Card sent: " + str(i + 1))
+        send_message(card_text, kb)
+        log("card sent: " + str(i + 1))
 
-    # Кнопка "ещё"
+    # Show more
     if len(scored) > PAGE_SIZE:
         left = len(scored) - PAGE_SIZE
         kb = {
-            "inline_keyboard": [
-                [
-                    {
-                        "text": "Показать ещё " + str(left),
-                        "callback_data": "personal_next:0",
-                    },
-                ],
-            ],
+            "inline_keyboard": [[
+                {
+                    "text": "Show more (" + str(left) + ")",
+                    "callback_data": "personal_next:0",
+                },
+            ]],
         }
-        notify_with_buttons(
-            "Всего найдено: " + str(total),
+        send_message(
+            "Total found: " + str(total),
             kb,
         )
 
-    print("Done")
+    log("done")
 
 
 if __name__ == "__main__":
