@@ -1,17 +1,18 @@
 # ============================================================
-# PERSONAL BOOKS - BOT HOST
+# Personal Books - BOT HOST v2
 # ------------------------------------------------------------
-# Telegram-бот для личной библиотеки.
-#   /find <тема>  - поиск книг
-#   /findnext     - ещё 5
-#   /audio        - список книг + аудио
+# v2: production-ready.
+#     - personal_next теперь через workflow (единый формат)
+#     - добавлена команда /next
+#     - добавлена команда /audio <имя>
+#     - логи с timestamp
+#     - короткие строки
 # ------------------------------------------------------------
 # Требования: aiogram, python-dotenv, requests
 # ============================================================
 
 import os
 import sys
-import base64
 import logging
 import requests
 
@@ -41,7 +42,6 @@ GITHUB_PAT = (
     or ""
 ).strip()
 GITHUB_REPO = (os.getenv("GITHUB_REPO") or "").strip()
-CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
 
 if not BOT_TOKEN:
     print("ERR: BOT_TOKEN not set")
@@ -93,7 +93,9 @@ def run_workflow(key, inputs=None):
     if inputs:
         data["inputs"] = inputs
     try:
-        r = requests.post(url, headers=headers, json=data, timeout=15)
+        r = requests.post(
+            url, headers=headers, json=data, timeout=15,
+        )
         if r.status_code in (200, 201, 204):
             return True, "OK"
         if r.status_code == 404:
@@ -155,7 +157,9 @@ def delete_file(path, sha, message="delete"):
     }
     data = {"message": message, "sha": sha, "branch": "main"}
     try:
-        r = requests.delete(url, headers=headers, json=data, timeout=15)
+        r = requests.delete(
+            url, headers=headers, json=data, timeout=15,
+        )
         return r.status_code in (200, 204)
     except Exception:
         return False
@@ -170,9 +174,14 @@ def send_dispatch(event_type, payload):
         "Authorization": "Bearer " + GITHUB_PAT,
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    data = {"event_type": event_type, "client_payload": payload}
+    data = {
+        "event_type": event_type,
+        "client_payload": payload,
+    }
     try:
-        r = requests.post(url, headers=headers, json=data, timeout=15)
+        r = requests.post(
+            url, headers=headers, json=data, timeout=15,
+        )
         return r.status_code == 204
     except Exception:
         return False
@@ -182,7 +191,6 @@ def send_dispatch(event_type, payload):
 # HELPERS
 # ------------------------------------------------------------
 def personal_books():
-    """Список PDF в personal_books/ (GitHub)."""
     items = list_dir("personal_books")
     books = {}
     for it in items:
@@ -200,44 +208,44 @@ def personal_books():
 
 def short_info():
     return (
-        "📚 Personal Books\n\n"
-        "Твоя личная библиотека.\n\n"
+        "Personal Books\n\n"
+        "Личная библиотека.\n\n"
         "Команды:\n"
         "/find тема - поиск книг\n"
         "/findnext - ещё 5 книг\n"
-        "/audio - список книг\n\n"
-        "Или используй кнопки внизу."
+        "/audio - список книг\n"
+        "/audio имя - сделать mp3\n\n"
+        "Или кнопки внизу."
     )
 
 
 def help_text():
     return (
-        "📚 Personal Books - справка\n\n"
-        "🔍 Поиск книг\n"
-        "Команда: /find тема\n"
-        "Пример: /find Schopenhauer\n\n"
-        "Найдёт книги в arXiv, Zenodo,\n"
-        "Semantic Scholar. Переведёт\n"
-        "заголовки на русский.\n\n"
-        "📥 Скачивание\n"
-        "После /find нажми [✅ Скачать]\n"
-        "PDF попадёт в personal_books/\n\n"
-        "🎧 Аудиокниги\n"
-        "Команда: /audio\n"
-        "Выбери книгу кнопками.\n"
-        "PDF -> mp3 (русский голос),\n"
-        "mp3 придут в Telegram.\n"
-        "MP3 удаляются после отправки.\n"
-        "PDF остаётся в репо.\n\n"
-        "━━━━━━━━━━━━━━━━\n"
-        "💡 Советы\n"
-        "━━━━━━━━━━━━━━━━\n\n"
-        "• Аудио идёт частями\n"
-        "  по 45 минут\n\n"
-        "• Длинная книга = 4-6 частей\n\n"
-        "• Скан PDF не читается\n"
-        "  (нужен текстовый)\n\n"
-        "• Файлы > 100 МБ не влезают\n"
+        "Personal Books - справка\n\n"
+        "Поиск книг\n"
+        "  /find тема\n"
+        "  Пример: /find Schopenhauer\n"
+        "  Источники: arXiv, Zenodo, Semantic Scholar\n\n"
+        "Ещё результаты\n"
+        "  /findnext\n"
+        "  Показать следующие 5 книг\n\n"
+        "Скачивание\n"
+        "  После /find нажми [Download]\n"
+        "  PDF попадёт в personal_books/\n\n"
+        "Аудиокниги\n"
+        "  /audio - список книг\n"
+        "  /audio имя - сделать mp3 (RU)\n"
+        "  PDF -> mp3, mp3 придут в Telegram\n"
+        "  MP3 удаляются после отправки\n"
+        "  PDF остаётся в репо\n\n"
+        "Мои книги\n"
+        "  /books или кнопка в меню\n"
+        "  Там же аудио и удаление\n\n"
+        "Советы\n"
+        "  Аудио идёт частями по 45 минут\n"
+        "  Длинная книга = 4-6 частей\n"
+        "  Скан PDF не читается (нужен текстовый)\n"
+        "  Файлы > 100 МБ не влезают"
     )
 
 
@@ -252,21 +260,21 @@ def kb_main():
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(
-                text="🔍 Найти книгу",
+                text="Найти книгу",
                 callback_data="menu:find",
             ),
             InlineKeyboardButton(
-                text="📚 Мои книги",
+                text="Мои книги",
                 callback_data="menu:books",
             ),
         ],
         [
             InlineKeyboardButton(
-                text="🎧 Аудио",
+                text="Аудио",
                 callback_data="menu:audio",
             ),
             InlineKeyboardButton(
-                text="ℹ️ Помощь",
+                text="Помощь",
                 callback_data="menu:help",
             ),
         ],
@@ -277,7 +285,7 @@ def kb_back(target="menu:main"):
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(
-                text="◀️ Назад",
+                text="Назад",
                 callback_data=target,
             ),
         ],
@@ -289,19 +297,19 @@ def kb_books_list(books):
     for name in books[:10]:
         rows.append([
             InlineKeyboardButton(
-                text="📖 " + name[:35],
+                text=name[:40],
                 callback_data="book:view:" + name,
             ),
         ])
     rows.append([
         InlineKeyboardButton(
-            text="🔄 Обновить",
+            text="Обновить",
             callback_data="menu:books",
         ),
     ])
     rows.append([
         InlineKeyboardButton(
-            text="◀️ Назад",
+            text="Назад",
             callback_data="menu:main",
         ),
     ])
@@ -312,23 +320,23 @@ def kb_book_actions(name):
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(
-                text="🎧 Аудио (RU)",
+                text="Аудио (RU)",
                 callback_data="book:audio:" + name,
             ),
         ],
         [
             InlineKeyboardButton(
-                text="🎧 Аудио (EN)",
+                text="Аудио (EN)",
                 callback_data="book:audio_en:" + name,
             ),
         ],
         [
             InlineKeyboardButton(
-                text="🗑 Удалить",
+                text="Удалить",
                 callback_data="book:del:" + name,
             ),
             InlineKeyboardButton(
-                text="◀️ К списку",
+                text="Назад",
                 callback_data="menu:books",
             ),
         ],
@@ -342,11 +350,11 @@ def kb_confirm(action, payload=""):
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(
-                text="✅ Да",
+                text="Да",
                 callback_data=cb_yes,
             ),
             InlineKeyboardButton(
-                text="❌ Отмена",
+                text="Отмена",
                 callback_data="menu:main",
             ),
         ],
@@ -378,15 +386,12 @@ async def cmd_find(message: types.Message):
     t = message.text.replace("/find", "", 1).strip()
     if not t:
         await message.answer(
-            "Напиши тему:\n"
-            "<code>/find Schopenhauer</code>",
-            parse_mode="HTML",
+            "Напиши: /find тема\n"
+            "Пример: /find Schopenhauer"
         )
         return
-
     await message.answer(
-        "🔍 Ищу книги: " + t
-        + "\n\n30-60 секунд..."
+        "Ищу книги: " + t + "\n\n30-60 секунд..."
     )
     send_dispatch("personal_find", {
         "topic": t,
@@ -396,27 +401,61 @@ async def cmd_find(message: types.Message):
 
 @dp.message(Command("findnext"))
 async def cmd_findnext(message: types.Message):
-    await message.answer("📖 Загружаю следующие...")
+    await message.answer("Загружаю следующие...")
+    send_dispatch("personal_next", {})
+
+
+@dp.message(Command("next"))
+async def cmd_next(message: types.Message):
+    await message.answer("Загружаю следующие...")
     send_dispatch("personal_next", {})
 
 
 @dp.message(Command("audio"))
 async def cmd_audio(message: types.Message):
-    await show_books_for_audio(message)
+    args = message.text.replace("/audio", "", 1).strip()
+    if not args:
+        await show_books_for_audio(message)
+        return
+
+    name = args
+    await message.answer(
+        "Аудио: " + name
+        + "\n\nЗапускаю обработку..."
+    )
+    ok, msg = run_workflow("audio", {
+        "book": name,
+        "prefer": "ru",
+    })
+    if not ok:
+        await message.answer("Ошибка: " + msg)
+
+
+@dp.message(Command("books"))
+async def cmd_books(message: types.Message):
+    books = personal_books()
+    if not books:
+        await message.answer(
+            "Книг нет.\nНайди через /find"
+        )
+        return
+    names = sorted(books.keys())
+    await message.answer(
+        "Мои книги (" + str(len(names)) + "):",
+        reply_markup=kb_books_list(names),
+    )
 
 
 async def show_books_for_audio(message):
     books = personal_books()
     if not books:
         await message.answer(
-            "🎧 Пока нет книг\n\n"
-            "Найди через /find и скачай."
+            "Книг нет.\nНайди через /find и скачай."
         )
         return
     names = sorted(books.keys())
     await message.answer(
-        "🎧 Мои книги ("
-        + str(len(names)) + "):",
+        "Аудио - выбери книгу:",
         reply_markup=kb_books_list(names),
     )
 
@@ -436,13 +475,10 @@ async def cb_main(cb: CallbackQuery):
 @dp.callback_query(F.data == "menu:find")
 async def cb_find(cb: CallbackQuery):
     await cb.message.edit_text(
-        "🔍 Поиск книг\n\n"
-        "Напиши:\n"
-        "<code>/find тема</code>\n\n"
-        "Пример:\n"
-        "<code>/find Schopenhauer</code>",
+        "Поиск книг\n\n"
+        "Напиши:\n/find тема\n\n"
+        "Пример:\n/find Schopenhauer",
         reply_markup=kb_back(),
-        parse_mode="HTML",
     )
     await cb.answer()
 
@@ -462,16 +498,14 @@ async def cb_audio_menu(cb: CallbackQuery):
     books = personal_books()
     if not books:
         await cb.message.edit_text(
-            "🎧 Пока нет книг\n\n"
-            "Найди через /find и скачай.",
+            "Книг нет.\nНайди через /find.",
             reply_markup=kb_back(),
         )
         await cb.answer()
         return
     names = sorted(books.keys())
     await cb.message.edit_text(
-        "🎧 Мои книги ("
-        + str(len(names)) + "):",
+        "Аудио - выбери книгу:",
         reply_markup=kb_books_list(names),
     )
     await cb.answer()
@@ -482,17 +516,14 @@ async def cb_books(cb: CallbackQuery):
     books = personal_books()
     if not books:
         await cb.message.edit_text(
-            "📚 Мои книги\n\n"
-            "Пока пусто.\n"
-            "Найди через /find.",
+            "Книг нет.\nНайди через /find.",
             reply_markup=kb_back(),
         )
         await cb.answer()
         return
     names = sorted(books.keys())
     await cb.message.edit_text(
-        "📚 Мои книги ("
-        + str(len(names)) + "):",
+        "Мои книги (" + str(len(names)) + "):",
         reply_markup=kb_books_list(names),
     )
     await cb.answer()
@@ -515,7 +546,7 @@ async def cb_book_view(cb: CallbackQuery):
     if "en" in variants:
         flags.append("EN")
 
-    text = "📖 " + name + "\n"
+    text = "Книга: " + name + "\n"
     text += "Форматы: " + " + ".join(flags)
 
     await cb.message.edit_text(
@@ -535,15 +566,13 @@ async def cb_book_audio(cb: CallbackQuery):
     })
     if ok:
         await cb.message.edit_text(
-            "🎧 Аудиокнига\n\n"
-            + name
-            + "\n\n⏳ 5-15 минут.\n"
-            + "mp3 придут частями.",
+            "Аудио (RU): " + name
+            + "\n\n5-15 минут.\nmp3 придут частями.",
             reply_markup=kb_book_actions(name),
         )
     else:
         await cb.message.edit_text(
-            "❌ " + msg,
+            "Ошибка: " + msg,
             reply_markup=kb_book_actions(name),
         )
 
@@ -558,14 +587,13 @@ async def cb_book_audio_en(cb: CallbackQuery):
     })
     if ok:
         await cb.message.edit_text(
-            "🎧 Аудиокнига (EN)\n\n"
-            + name
-            + "\n\n⏳ 5-15 минут.",
+            "Аудио (EN): " + name
+            + "\n\n5-15 минут.",
             reply_markup=kb_book_actions(name),
         )
     else:
         await cb.message.edit_text(
-            "❌ " + msg,
+            "Ошибка: " + msg,
             reply_markup=kb_book_actions(name),
         )
 
@@ -574,8 +602,7 @@ async def cb_book_audio_en(cb: CallbackQuery):
 async def cb_book_del(cb: CallbackQuery):
     name = cb.data.replace("book:del:", "", 1)
     await cb.message.edit_text(
-        "🗑 Удалить книгу?\n\n"
-        + name
+        "Удалить книгу?\n\n" + name
         + "\n\nБудут удалены все PDF.",
         reply_markup=kb_confirm("book_del", name),
     )
@@ -604,16 +631,15 @@ async def cb_confirm_book_del(cb: CallbackQuery):
         )
         if ok:
             deleted += 1
-
     await cb.message.edit_text(
-        "✅ Удалено файлов: " + str(deleted),
+        "Удалено файлов: " + str(deleted),
         reply_markup=kb_back("menu:books"),
     )
     await cb.answer()
 
 
 # ------------------------------------------------------------
-# CALLBACKS - PERSONAL SEARCH
+# CALLBACKS - SEARCH RESULTS
 # ------------------------------------------------------------
 @dp.callback_query(F.data.startswith("personal_dl:"))
 async def cb_pdl(cb: CallbackQuery):
@@ -622,7 +648,7 @@ async def cb_pdl(cb: CallbackQuery):
 
     cand = read_json("data/personal_candidates.json")
     if not cand:
-        await cb.message.edit_text("❌ Нет списка")
+        await cb.message.edit_text("Нет списка")
         return
 
     items = cand.get("items", [])
@@ -641,7 +667,7 @@ async def cb_pdl(cb: CallbackQuery):
     title = item.get("title", "book")
 
     if not url:
-        await cb.message.edit_text("❌ Нет URL")
+        await cb.message.edit_text("Нет URL")
         return
 
     send_dispatch("personal_download", {
@@ -650,10 +676,9 @@ async def cb_pdl(cb: CallbackQuery):
     })
 
     await cb.message.edit_text(
-        "📥 Скачиваю\n\n"
-        + title[:150]
-        + "\n\n⏳ 1-2 минуты.\n"
-        + "PDF появится в personal_books/",
+        "Скачиваю:\n\n" + title[:150]
+        + "\n\n1-2 минуты.\n"
+        + "PDF появится в personal_books/"
     )
 
 
@@ -670,56 +695,9 @@ async def cb_personal_reject(cb: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("personal_next:"))
 async def cb_pnext(cb: CallbackQuery):
+    """Отправляем dispatch - workflow сам отрисует карточки."""
     await cb.answer("Загружаю...")
-
-    cand = read_json("data/personal_candidates.json")
-    if not cand:
-        return
-
-    items = cand.get("items", [])
-    offset = cand.get("offset", 5)
-    total = len(items)
-
-    next_batch = items[offset:offset + 5]
-    if not next_batch:
-        await cb.message.edit_text("Больше нет книг")
-        return
-
-    for i, item in enumerate(next_batch):
-        real_i = offset + i
-        title = item.get("title", "?")[:200]
-        source = item.get("source", "?")
-        card = "<b>" + str(real_i + 1) + "/"
-        card += str(total) + "</b>\n"
-        card += "<b>" + title + "</b>\n\n"
-        card += "📡 " + source
-        kb = {
-            "inline_keyboard": [[
-                {
-                    "text": "✅ Скачать",
-                    "callback_data": "personal_dl:"
-                                     + str(real_i),
-                },
-                {
-                    "text": "❌ Отклонить",
-                    "callback_data": "personal_reject:"
-                                     + str(real_i),
-                },
-            ]],
-        }
-        try:
-            url = "https://api.telegram.org/bot"
-            url += BOT_TOKEN + "/sendMessage"
-            requests.post(url, json={
-                "chat_id": cb.from_user.id,
-                "text": card,
-                "parse_mode": "HTML",
-                "reply_markup": kb,
-                "disable_web_page_preview": True,
-            }, timeout=15)
-        except Exception:
-            pass
-
+    send_dispatch("personal_next", {})
     try:
         await cb.message.edit_reply_markup(
             reply_markup=None,
@@ -732,7 +710,7 @@ async def cb_pnext(cb: CallbackQuery):
 # RUN
 # ------------------------------------------------------------
 async def main():
-    logger.info("Personal Books Bot started")
+    logger.info("Personal Books Bot v2 started")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
