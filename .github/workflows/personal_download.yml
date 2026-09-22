@@ -2,8 +2,8 @@
 # ARGUS - СКАЧИВАНИЕ ЛИЧНОЙ КНИГИ
 # ------------------------------------------------------------
 # v1.1: fix имени скрипта (personal_downloader.py)
-# v1.0: принимает URL и title через repository_dispatch
-#       скачивает PDF -> коммитит в personal_books/
+# v1.0: принимает URL и title через repository_dispatch,
+#       скачивает PDF и коммитит в personal_books/
 # ============================================================
 
 name: Personal Download
