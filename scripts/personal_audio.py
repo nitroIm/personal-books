@@ -1,14 +1,16 @@
 # ============================================================
-# Personal Books - AUDIO (PDF -> MP3 -> Telegram)
+# Personal Books - AUDIO (PDF -> TEXT -> RU -> MP3 -> TG)
 # ------------------------------------------------------------
-# v2: production-ready.
-#     - уведомление при mp3 > 50 МБ
-#     - вывод короче (для больших книг)
-#     - защита от параллельных запусков
-#     - отчёт в конце с размерами
-# ------------------------------------------------------------
+# v3: перевод PDF на русский перед озвучкой.
+#     - если PDF уже RU - перевод пропускается
+#     - кэш перевода: personal_books/<name>_RU.txt
+#     - второй запуск не переводит заново
+#     - требует translate.py рядом (EN->RU)
+# v2: production-ready (batch, concat, лимиты)
+# ============================================================
 # Требования:
-#   pip install gTTS PyPDF2
+#   pip install gTTS PyPDF2 transformers
+#                sentencepiece torch
 #   apt install ffmpeg
 # ============================================================
 
@@ -30,11 +32,23 @@ TEMP_DIR = Path("/tmp/personal_books_audio")
 PERSONAL_DIR.mkdir(parents=True, exist_ok=True)
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
+# --- translate.py рядом ---
+sys.path.insert(0, str(SCRIPT_DIR))
+TRANSLATE_OK = False
+try:
+    from translate import translate_batch
+    from translate import save_cache
+    TRANSLATE_OK = True
+except ImportError as e:
+    print("WARN: translate.py missing: " + str(e))
+
 # --- Настройки ---
 SEGMENT_MINUTES = 45
 GTTS_BATCH_CHARS = 1800
 TELEGRAM_LIMIT_MB = 48
 CHARS_PER_MINUTE = 900
+TRANSLATE_CHUNK = 500
+TRANSLATE_BATCH = 32
 
 # --- Telegram ---
 BOT_TOKEN = (
@@ -149,7 +163,71 @@ def extract_text(pdf_path):
 
 
 # ============================================================
-# SPLIT
+# LANG DETECT
+# ============================================================
+def is_russian(text):
+    sample = text[:3000]
+    letters = [c for c in sample if c.isalpha()]
+    if not letters:
+        return False
+    cyr = 0
+    for c in letters:
+        if "\u0400" <= c <= "\u04ff":
+            cyr += 1
+    return (cyr / len(letters)) > 0.5
+
+
+# ============================================================
+# TRANSLATE LONG TEXT
+# ============================================================
+def split_for_translate(text):
+    chunks = []
+    current = ""
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            if current:
+                chunks.append(current)
+                current = ""
+            continue
+        if len(current) + len(line) + 1 <= TRANSLATE_CHUNK:
+            if current:
+                current = current + " " + line
+            else:
+                current = line
+        else:
+            if current:
+                chunks.append(current)
+            current = line
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def translate_long_text(text):
+    if not TRANSLATE_OK:
+        log("translate.py missing")
+        return text
+
+    chunks = split_for_translate(text)
+    log("translate chunks: " + str(len(chunks)))
+
+    out = []
+    total = len(chunks)
+    for i in range(0, total, TRANSLATE_BATCH):
+        batch = chunks[i:i + TRANSLATE_BATCH]
+        result = translate_batch(batch)
+        out.extend(result)
+        done = min(i + TRANSLATE_BATCH, total)
+        if i % (TRANSLATE_BATCH * 5) == 0:
+            log("  translated " + str(done) + "/" + str(total))
+
+    save_cache()
+    return "\n\n".join(out)
+
+
+# ============================================================
+# SPLIT FOR AUDIO
 # ============================================================
 def split_into_segments(text, segment_chars):
     sentences = re.split(r"(?<=[.!?])\s+", text)
@@ -160,7 +238,10 @@ def split_into_segments(text, segment_chars):
         if not sent:
             continue
         if len(current) + len(sent) + 1 <= segment_chars:
-            current = current + " " + sent if current else sent
+            if current:
+                current = current + " " + sent
+            else:
+                current = sent
         else:
             if current:
                 segments.append(current)
@@ -179,7 +260,10 @@ def split_for_gtts(text, batch_chars):
         if not sent:
             continue
         if len(current) + len(sent) + 1 <= batch_chars:
-            current = current + " " + sent if current else sent
+            if current:
+                current = current + " " + sent
+            else:
+                current = sent
         else:
             if current:
                 batches.append(current)
@@ -271,7 +355,7 @@ def segment_to_audio(segment_text, out_mp3):
 
 
 # ============================================================
-# DEPENDENCIES
+# DEPS
 # ============================================================
 def check_deps():
     errors = []
@@ -309,7 +393,7 @@ def list_books():
 
 
 # ============================================================
-# MAIN WORK
+# MAIN
 # ============================================================
 def make_audio(base_name, prefer="ru", keep=False):
     books = list_books()
@@ -339,11 +423,47 @@ def make_audio(base_name, prefer="ru", keep=False):
         + "\n\nplease wait..."
     )
 
-    text = extract_text(pdf_path)
+    # --- Кэш перевода ---
+    ru_txt = pdf_path.with_name(
+        pdf_path.stem + "_RU.txt"
+    )
+
+    if prefer == "ru" and ru_txt.exists():
+        log("using cached translation: " + ru_txt.name)
+        text = ru_txt.read_text(encoding="utf-8")
+        log("chars: " + str(len(text)))
+    else:
+        text = extract_text(pdf_path)
+        if not text.strip():
+            notify("Cannot extract text (scan?)")
+            return False
+
+        if prefer == "ru":
+            if is_russian(text):
+                log("text already RU, no translate")
+            else:
+                if not TRANSLATE_OK:
+                    notify(
+                        "translate.py missing\n"
+                        "put it next to personal_audio.py"
+                    )
+                    return False
+                log("translating text...")
+                text = translate_long_text(text)
+                log("translated: " + str(len(text)) + " chars")
+                try:
+                    ru_txt.write_text(
+                        text, encoding="utf-8"
+                    )
+                    log("saved: " + ru_txt.name)
+                except Exception as e:
+                    log("save txt: " + str(e))
+
     if not text.strip():
-        notify("Cannot extract text (scan?)")
+        notify("Empty text after processing")
         return False
 
+    # --- Сегменты ---
     segment_chars = SEGMENT_MINUTES * CHARS_PER_MINUTE
     segments = split_into_segments(text, segment_chars)
     log("segments: " + str(len(segments)))
