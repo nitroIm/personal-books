@@ -1,9 +1,11 @@
 # ============================================================
-# ARGUS - АУДИОКНИГА ИЗ PDF
+# ARGUS - PERSONAL AUDIO (PDF -> TEXT -> RU -> MP3 -> TG)
 # ------------------------------------------------------------
-# Читает PDF из personal_books/, делает mp3, отправляет в TG.
-# mp3 в /tmp (удаляется после отправки).
-# PDF остаётся в репо.
+# v2: мультиязычный перевод (NLLB-200).
+#     - принимает book через dispatch
+#     - ffmpeg для concat mp3
+#     - кэш _RU.txt коммитится обратно
+# v1: базовый PDF -> MP3
 # ============================================================
 
 name: Personal Audio
@@ -19,10 +21,10 @@ on:
         required: false
         default: 'ru'
   repository_dispatch:
-    types: [run_audio]
+    types: [personal_audio]
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: argus-personal-audio
@@ -31,47 +33,90 @@ concurrency:
 jobs:
   audio:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 180
 
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
-          lfs: true
 
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
-      - name: Install deps
+      - name: Install ffmpeg
         run: |
-          python -m pip install --upgrade pip
-          pip install gTTS==2.5.1
-          pip install PyPDF2==3.0.1
-          pip install requests==2.32.3
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
 
-      - name: Check ffmpeg
-        run: ffmpeg -version | head -1
+      - name: Install Python deps
+        run: |
+          pip install --upgrade pip
+          pip install requests==2.32.3
+          pip install gTTS
+          pip install PyPDF2
+          pip install langdetect
+          pip install transformers==4.41.2
+          pip install sentencepiece
+          pip install torch==2.2.0 \
+            --index-url https://download.pytorch.org/whl/cpu
 
       - name: Run audio
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          BOOK: ${{ github.event.client_payload.book || github.event.inputs.book }}
-          PREFER: ${{ github.event.client_payload.prefer || github.event.inputs.prefer }}
+          BOOK: >-
+            ${{ github.event.client_payload.book
+             || github.event.inputs.book }}
+          PREFER: >-
+            ${{ github.event.client_payload.prefer
+             || github.event.inputs.prefer
+             || 'ru' }}
+          TELEGRAM_BOT_TOKEN: >-
+            ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: >-
+            ${{ secrets.TELEGRAM_CHAT_ID }}
+          PYTHONUNBUFFERED: '1'
         run: |
-          if [ -z "$BOOK" ]; then
-            echo "BOOK not set"
-            exit 1
+          cd scripts
+          if [ "${PREFER}" = "en" ]; then
+            python personal_audio.py "${BOOK}" --en
+          else
+            python personal_audio.py "${BOOK}"
           fi
-          python scripts/personal_audio.py "$BOOK" --$PREFER
+
+      - name: Commit RU cache
+        if: always()
+        run: |
+          git config user.name "ARGUS"
+          git config user.email "argus@github.com"
+          git add personal_books/*_RU.txt || true
+          git add data/translation_cache.json || true
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "ARGUS: audio cache [skip ci]"
+          for i in 1 2 3; do
+            git pull --rebase --autostash origin main
+            if git push origin main; then
+              echo "Push OK"
+              break
+            fi
+            echo "Retry $i"
+            sleep 5
+          done
 
       - name: Notify on failure
         if: failure()
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_BOT_TOKEN: >-
+            ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: >-
+            ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+          curl -s -X POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -H "Content-Type: application/json" \
-            -d "{\"chat_id\": \"${TELEGRAM_CHAT_ID}\", \"text\": \"Audio упал\", \"parse_mode\": \"HTML\"}" || true
+            -d "{\"chat_id\": \"${TELEGRAM_CHAT_ID}\", \
+                 \"text\": \"Personal Audio упал\", \
+                 \"parse_mode\": \"HTML\"}" || true
