@@ -1,18 +1,19 @@
 # ============================================================
-# Personal Books - TRANSLATE (any -> RU) v4 [PRODUCTION]
+# Personal Books - TRANSLATE (any -> RU) v5
 # ------------------------------------------------------------
-# v4: мультиязычный перевод через NLLB-200.
-#     - 200+ языков -> русский напрямую
-#     - авто-детект исходного языка (langdetect)
-#     - файловый кэш
-#     - batch-перевод
-#     - ленивая загрузка модели
-# ------------------------------------------------------------
+# v5: fix зацикливания NLLB.
+#     - no_repeat_ngram_size + repetition_penalty
+#     - num_beams=1 (быстрее, стабильнее)
+#     - looks_broken() откат к оригиналу
+#     - защита от коротких чанков
+# v4: NLLB-200 мультиязычный
+# ============================================================
 # Требования:
 #   pip install transformers==4.41.2
 #               sentencepiece
 #               torch==2.2.0
 #               langdetect
+#               numpy<2
 # ============================================================
 
 import os
@@ -20,6 +21,7 @@ import json
 import hashlib
 import threading
 from pathlib import Path
+from collections import Counter
 
 # --- Пути ---
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -33,8 +35,10 @@ TGT_LANG = "rus_Cyrl"
 MAX_CHARS = 500
 BATCH_SIZE = 8
 CACHE_MAX_SIZE = 5000
+MIN_TRANSLATE_CHARS = 8
+BROKEN_RATIO = 0.5
 
-# --- Коды NLLB для langdetect ---
+# --- Карта языков ---
 LANG_MAP = {
     "en": "eng_Latn",
     "es": "spa_Latn",
@@ -76,6 +80,13 @@ _cache = None
 
 
 # ============================================================
+# LOG
+# ============================================================
+def log(msg):
+    print("[translate] " + str(msg), flush=True)
+
+
+# ============================================================
 # КЭШ
 # ============================================================
 def _load_cache() -> dict:
@@ -101,7 +112,10 @@ def _save_cache():
     try:
         if len(_cache) > CACHE_MAX_SIZE:
             keys = list(_cache.keys())
-            new_cache = {k: _cache[k] for k in keys[-CACHE_MAX_SIZE:]}
+            new_cache = {
+                k: _cache[k]
+                for k in keys[-CACHE_MAX_SIZE:]
+            }
             _cache.clear()
             _cache.update(new_cache)
 
@@ -109,7 +123,7 @@ def _save_cache():
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(_cache, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print("warn: cache save failed: " + str(e))
+        log("cache save failed: " + str(e))
 
 
 def _cache_key(text: str) -> str:
@@ -120,25 +134,55 @@ def _cache_key(text: str) -> str:
 # LANG DETECT
 # ============================================================
 def detect_lang(text: str) -> str:
-    """Определяет язык текста. Возвращает код типа 'en', 'es'."""
     try:
         from langdetect import detect
-        code = detect(text[:500])
-        return code
+        return detect(text[:500])
     except Exception:
         return "en"
 
 
 def get_nllb_code(lang: str) -> str:
-    """Конвертирует код langdetect в код NLLB."""
     lang = lang.lower()
     if lang in LANG_MAP:
         return LANG_MAP[lang]
-    # Fallback: пробуем по первым двум буквам
     short = lang[:2]
     if short in LANG_MAP:
         return LANG_MAP[short]
     return "eng_Latn"
+
+
+# ============================================================
+# GUARDS
+# ============================================================
+def looks_broken(text: str) -> bool:
+    """Одно слово >50% всего текста = зацикливание."""
+    if not text:
+        return False
+    words = text.split()
+    if len(words) < 5:
+        return False
+    counts = Counter(words)
+    top_word, top_count = counts.most_common(1)[0]
+    ratio = top_count / len(words)
+    if ratio > BROKEN_RATIO:
+        return True
+    # Если 3 последних слова одинаковые — тоже залип
+    if len(words) >= 3:
+        if words[-1] == words[-2] == words[-3]:
+            return True
+    return False
+
+
+def _should_skip(text: str) -> bool:
+    """Слишком короткий или мусор — не переводим."""
+    t = text.strip()
+    if len(t) < MIN_TRANSLATE_CHARS:
+        return True
+    # Только цифры / символы
+    letters = sum(1 for c in t if c.isalpha())
+    if letters < 3:
+        return True
+    return False
 
 
 # ============================================================
@@ -153,7 +197,7 @@ def _load_model():
                 AutoModelForSeq2SeqLM,
                 AutoTokenizer,
             )
-            print("Loading NLLB-200: " + MODEL_NAME)
+            log("loading NLLB: " + MODEL_NAME)
             _tokenizer = AutoTokenizer.from_pretrained(
                 MODEL_NAME,
                 src_lang="eng_Latn",
@@ -162,8 +206,35 @@ def _load_model():
                 MODEL_NAME
             )
             _model.eval()
-            print("NLLB-200 ready")
+            log("NLLB ready")
     return _model, _tokenizer
+
+
+def _generate(model, tokenizer, texts):
+    """Единая точка генерации с защитой от повторов."""
+    import torch
+    tokens = tokenizer(
+        texts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=512,
+    )
+    with torch.no_grad():
+        translated = model.generate(
+            **tokens,
+            forced_bos_token_id=tokenizer.convert_tokens_to_ids(
+                TGT_LANG
+            ),
+            max_new_tokens=400,
+            num_beams=1,
+            no_repeat_ngram_size=4,
+            repetition_penalty=1.3,
+            length_penalty=1.0,
+        )
+    return tokenizer.batch_decode(
+        translated, skip_special_tokens=True
+    )
 
 
 # ============================================================
@@ -176,10 +247,10 @@ def is_russian(text: str) -> bool:
     letters = [c for c in sample if c.isalpha()]
     if not letters:
         return False
-    cyr = 0
-    for c in letters:
-        if "\u0400" <= c <= "\u04ff":
-            cyr += 1
+    cyr = sum(
+        1 for c in letters
+        if "\u0400" <= c <= "\u04ff"
+    )
     return (cyr / len(letters)) > 0.5
 
 
@@ -196,43 +267,31 @@ def translate_to_ru(text: str) -> str:
         cache[key] = text
         return text
 
+    if _should_skip(text):
+        cache[key] = text
+        return text
+
     src_lang = detect_lang(text)
     nllb_src = get_nllb_code(src_lang)
 
     try:
-        import torch
         model, tokenizer = _load_model()
-
         tokenizer.src_lang = nllb_src
         truncated = text[:MAX_CHARS]
-        tokens = tokenizer(
-            [truncated],
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=512,
+        decoded = _generate(
+            model, tokenizer, [truncated]
         )
+        result = decoded[0].strip() if decoded else ""
 
-        with torch.no_grad():
-            translated = model.generate(
-                **tokens,
-                forced_bos_token_id=tokenizer.lang_code_to_id[
-                    TGT_LANG
-                ],
-                max_length=512,
-            )
-
-        result = tokenizer.decode(
-            translated[0], skip_special_tokens=True
-        ).strip()
-
-        if result:
+        if result and not looks_broken(result):
             cache[key] = result
             return result
 
+        log("broken/empty, keeping original")
     except Exception as e:
-        print("translate err: " + str(e))
+        log("translate err: " + str(e))
 
+    cache[key] = text
     return text
 
 
@@ -246,7 +305,7 @@ def translate_batch(texts: list) -> list:
     to_translate_texts = []
     to_translate_srcs = []
 
-    # 1. Проверяем кэш и русский
+    # 1. Кэш / русский / мусор
     for i, text in enumerate(texts):
         if not text or not text.strip():
             results[i] = text
@@ -259,6 +318,10 @@ def translate_batch(texts: list) -> list:
             cache[key] = text
             results[i] = text
             continue
+        if _should_skip(text):
+            cache[key] = text
+            results[i] = text
+            continue
         to_translate_idx.append(i)
         to_translate_texts.append(text[:MAX_CHARS])
         to_translate_srcs.append(detect_lang(text))
@@ -266,84 +329,55 @@ def translate_batch(texts: list) -> list:
     if not to_translate_texts:
         return results
 
-    # 2. Батч через модель
+    # 2. Батч
     try:
-        import torch
         model, tokenizer = _load_model()
 
-        for start in range(0, len(to_translate_texts), BATCH_SIZE):
+        for start in range(
+            0, len(to_translate_texts), BATCH_SIZE
+        ):
             batch = to_translate_texts[start:start + BATCH_SIZE]
             srcs = to_translate_srcs[start:start + BATCH_SIZE]
 
-            # NLLB требует один src_lang на батч
-            # Если языки разные — переводим по одному
             unique_srcs = set(srcs)
             if len(unique_srcs) > 1:
+                # Разные языки — по одному
                 for j, text in enumerate(batch):
                     idx = to_translate_idx[start + j]
                     src = get_nllb_code(srcs[j])
                     tokenizer.src_lang = src
-                    tokens = tokenizer(
-                        [text],
-                        return_tensors="pt",
-                        padding=True,
-                        truncation=True,
-                        max_length=512,
+                    decoded = _generate(
+                        model, tokenizer, [text]
                     )
-                    with torch.no_grad():
-                        translated = model.generate(
-                            **tokens,
-                            forced_bos_token_id=(
-                                tokenizer.lang_code_to_id[
-                                    TGT_LANG
-                                ]
-                            ),
-                            max_length=512,
-                        )
-                    result = tokenizer.decode(
-                        translated[0],
-                        skip_special_tokens=True,
-                    ).strip()
-                    if result:
+                    result = (
+                        decoded[0].strip() if decoded else ""
+                    )
+                    if result and not looks_broken(result):
                         results[idx] = result
                         cache[_cache_key(texts[idx])] = result
                     else:
                         results[idx] = texts[idx]
+                        cache[_cache_key(texts[idx])] = texts[idx]
                 continue
 
-            # Один язык на весь батч
+            # Один язык
             src = get_nllb_code(srcs[0])
             tokenizer.src_lang = src
-            tokens = tokenizer(
-                batch,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=512,
-            )
-            with torch.no_grad():
-                translated = model.generate(
-                    **tokens,
-                    forced_bos_token_id=tokenizer.lang_code_to_id[
-                        TGT_LANG
-                    ],
-                    max_length=512,
-                )
-            decoded = tokenizer.batch_decode(
-                translated, skip_special_tokens=True
-            )
+            decoded = _generate(model, tokenizer, batch)
 
             for j, result in enumerate(decoded):
                 idx = to_translate_idx[start + j]
                 result = result.strip()
-                if result:
+                if result and not looks_broken(result):
                     results[idx] = result
                     cache[_cache_key(texts[idx])] = result
                 else:
+                    log("broken chunk, keeping original")
                     results[idx] = texts[idx]
+                    cache[_cache_key(texts[idx])] = texts[idx]
 
     except Exception as e:
-        print("batch translate err: " + str(e))
+        log("batch err: " + str(e))
         for idx in to_translate_idx:
             if results[idx] is None:
                 results[idx] = texts[idx]
