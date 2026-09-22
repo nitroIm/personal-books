@@ -27,3 +27,4 @@ tokenizers==0.19.1
 
 # Числа / массивы
 numpy==1.26.4
+langdetect
