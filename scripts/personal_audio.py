@@ -1,16 +1,17 @@
 # ============================================================
 # Personal Books - AUDIO (PDF -> TEXT -> RU -> MP3 -> TG)
 # ------------------------------------------------------------
+# v3.1: fix — принимаем book с .pdf / _RU.
 # v3: перевод PDF на русский перед озвучкой.
 #     - если PDF уже RU - перевод пропускается
 #     - кэш перевода: personal_books/<name>_RU.txt
 #     - второй запуск не переводит заново
-#     - требует translate.py рядом (EN->RU)
+#     - требует translate.py рядом (NLLB)
 # v2: production-ready (batch, concat, лимиты)
 # ============================================================
 # Требования:
 #   pip install gTTS PyPDF2 transformers
-#                sentencepiece torch
+#                sentencepiece torch langdetect
 #   apt install ffmpeg
 # ============================================================
 
@@ -393,12 +394,29 @@ def list_books():
 
 
 # ============================================================
+# NAME NORMALIZE
+# ============================================================
+def normalize_book_name(name):
+    name = name.strip()
+    if name.lower().endswith(".pdf"):
+        name = name[:-4]
+    if name.endswith("_RU"):
+        name = name[:-3]
+    return name.strip()
+
+
+# ============================================================
 # MAIN
 # ============================================================
 def make_audio(base_name, prefer="ru", keep=False):
+    base_name = normalize_book_name(base_name)
+
     books = list_books()
     if base_name not in books:
         log("book not found: " + base_name)
+        log("available:")
+        for k in books.keys():
+            log("  " + k)
         return False
 
     variants = books[base_name]
