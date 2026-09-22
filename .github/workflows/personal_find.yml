@@ -1,7 +1,11 @@
 # ============================================================
 # Personal Books - FIND
 # ------------------------------------------------------------
-# Поиск книг по теме. Результат -> Telegram.
+# v2: NLLB перевод карточек (любой язык -> RU).
+#     - CPU torch
+#     - langdetect для детекта языка
+#     - кэш HF моделей
+# v1: базовый поиск + отправка карточек
 # ============================================================
 
 name: Personal Find
@@ -25,7 +29,7 @@ concurrency:
 jobs:
   find:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
 
     steps:
       - name: Checkout
@@ -37,37 +41,37 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: pip-personal-find-v1
-          restore-keys: pip-personal-
+          cache: 'pip'
 
       - name: Cache HuggingFace
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
-          key: hf-personal-translate-v1
-          restore-keys: hf-personal-
+          key: hf-nllb-find-v1
+          restore-keys: hf-nllb-
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install torch==2.2.0 --index-url https://download.pytorch.org/whl/cpu
+          pip install torch==2.2.0 \
+            --index-url https://download.pytorch.org/whl/cpu
           pip install transformers==4.41.2
           pip install sentencepiece==0.2.0
           pip install sacremoses==0.1.1
           pip install tokenizers==0.19.1
           pip install numpy==1.26.4
           pip install requests==2.32.3
+          pip install langdetect==1.0.9
 
       - name: Run personal finder
         env:
-          TOPIC: ${{ github.event.client_payload.topic || github.event.inputs.topic }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TOPIC: >-
+            ${{ github.event.client_payload.topic
+             || github.event.inputs.topic }}
+          TELEGRAM_BOT_TOKEN: >-
+            ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: >-
+            ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           echo "Topic: $TOPIC"
           python scripts/personal_finder.py "$TOPIC"
@@ -77,12 +81,10 @@ jobs:
           git config user.name "Personal Books"
           git config user.email "personal@github.com"
           git add data/personal_candidates.json || true
-
           if git diff --staged --quiet; then
             echo "No changes"
             exit 0
           fi
-
           git commit -m "personal: find [skip ci]"
           for i in 1 2 3; do
             git pull --rebase --autostash origin main
@@ -97,9 +99,14 @@ jobs:
       - name: Notify on failure
         if: failure()
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_BOT_TOKEN: >-
+            ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: >-
+            ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+          curl -s -X POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -H "Content-Type: application/json" \
-            -d "{\"chat_id\": \"${TELEGRAM_CHAT_ID}\", \"text\": \"Personal Find упал\", \"parse_mode\": \"HTML\"}" || true
+            -d "{\"chat_id\": \"${TELEGRAM_CHAT_ID}\", \
+                 \"text\": \"Personal Find упал\", \
+                 \"parse_mode\": \"HTML\"}" || true
