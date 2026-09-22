@@ -1,0 +1,29 @@
+# ============================================================
+# Personal Books — зависимости
+# ============================================================
+
+# Telegram-бот
+aiogram==3.13.0
+python-dotenv==1.0.1
+
+# HTTP
+requests==2.32.3
+
+# PDF → текст
+PyPDF2==3.0.1
+
+# PDF создание
+fpdf2==2.7.9
+
+# TTS (текст → речь)
+gTTS==2.5.1
+
+# Перевод EN↔RU (Helsinki-NLP)
+torch==2.2.0
+transformers==4.41.2
+sentencepiece==0.2.0
+sacremoses==0.1.1
+tokenizers==0.19.1
+
+# Числа / массивы
+numpy==1.26.4
